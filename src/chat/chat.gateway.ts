@@ -12,6 +12,26 @@ import { ChatService } from './chat.service';
 import { EVENTS } from '../core/constants/app.constant';
 import { AuthService } from '../auth/auth.service';
 import { JwtService } from '@nestjs/jwt';
+import { User } from '../auth/entities/user.entity';
+import { MessageService } from '../message/message.service';
+import { Conversation } from './entities/conversation.entity';
+import { Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+
+// ================= TYPES =================
+
+interface SocketWithUser extends Socket {
+  data: {
+    user: User;
+  };
+}
+
+type JwtPayload = {
+  sub: string;
+  username: string;
+};
+
+// ================= GATEWAY =================
 
 @WebSocketGateway({
   cors: {
@@ -23,6 +43,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly chatService: ChatService,
     private readonly authService: AuthService,
     private readonly jwtService: JwtService,
+    private readonly messageService: MessageService,
+
+    @InjectRepository(Conversation)
+    private readonly conversationRepo: Repository<Conversation>,
   ) {}
 
   @WebSocketServer()
@@ -30,18 +54,42 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   // ================= CONNECTION =================
 
-  handleConnection(client: Socket) {
-    console.log(`Client connected: ${client.id}`);
+  async handleConnection(client: SocketWithUser) {
+    try {
+      const token = client.handshake.auth?.token as string;
+
+      if (!token) {
+        throw new Error('No token provided');
+      }
+
+      const decoded = this.jwtService.verify<JwtPayload>(token);
+
+      const user = await this.authService.validateUserById(decoded.sub);
+
+      if (!user) {
+        throw new Error('User not found');
+      }
+
+      // attach authenticated user
+      client.data.user = user;
+
+      console.log(`Authenticated user: ${user.username}`);
+    } catch (err) {
+      console.error('Unauthorized socket connection', err);
+      client.disconnect();
+    }
   }
 
-  handleDisconnect(client: Socket) {
-    const user = this.chatService.getUser(client.id);
+  // ================= DISCONNECT =================
 
-    if (user) {
+  handleDisconnect(client: SocketWithUser) {
+    const userSession = this.chatService.getUser(client.id);
+
+    if (userSession) {
       this.chatService.removeUser(client.id);
 
-      this.server.to(user.room).emit(EVENTS.USER_LEFT, {
-        user: user.username,
+      this.server.to(userSession.conversationId).emit(EVENTS.USER_LEFT, {
+        user: userSession.username,
       });
     }
 
@@ -51,42 +99,67 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // ================= JOIN ROOM =================
 
   @SubscribeMessage(EVENTS.JOIN)
-  handleJoin(
-    @MessageBody()
-    data: { username: string; room: string },
-    @ConnectedSocket() client: Socket,
+  async handleJoin(
+    @MessageBody() data: { conversationId: string },
+    @ConnectedSocket() client: SocketWithUser,
   ) {
-    const { username, room } = data;
+    console.log('Join event received:', data);
 
-    // validation
-    if (!username || !room) {
-      client.emit('error', { message: 'Username and room are required' });
+    const user = client.data.user;
+    const { conversationId } = data;
+
+    if (!user || !conversationId) {
+      console.log('Invalid join request: missing user or conversationId', user);
+      console.log(
+        'Invalid join request: missing user or conversationId',
+        conversationId,
+      );
+      client.emit('error', { message: 'Invalid request' });
       return;
     }
 
-    // join socket.io room
-    void client.join(room);
+    // 🔴 STEP 1: fetch conversation with participants
+    const conversation = await this.conversationRepo.findOne({
+      where: { id: conversationId },
+      relations: ['participants'],
+    });
 
-    // store user
-    this.chatService.addUser(client.id, username, room);
+    if (!conversation) {
+      client.emit('error', { message: 'Conversation not found' });
+      return;
+    }
 
-    // notify room
-    this.server.to(room).emit(EVENTS.USER_JOINED, {
-      user: username,
+    // 🔴 STEP 2: check if user belongs to this conversation
+    const isParticipant = conversation.participants.some(
+      (participant) => participant.id === user.id,
+    );
+
+    if (!isParticipant) {
+      client.emit('error', { message: 'Access denied' });
+      return;
+    }
+
+    // ✅ STEP 3: now allow join
+    client.join(conversationId);
+
+    this.chatService.addUser(client.id, user.username, conversationId);
+
+    this.server.to(conversationId).emit(EVENTS.USER_JOINED, {
+      user: user.username,
     });
   }
 
   // ================= SEND MESSAGE =================
 
   @SubscribeMessage(EVENTS.MESSAGE)
-  handleMessage(
+  async handleMessage(
     @MessageBody() data: { message: string },
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket() client: SocketWithUser,
   ) {
-    const user = this.chatService.getUser(client.id);
+    const user = client.data.user;
 
     if (!user) {
-      client.emit('error', { message: 'User not joined' });
+      client.emit('error', { message: 'Unauthorized' });
       return;
     }
 
@@ -94,9 +167,33 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    const payload = this.chatService.createMessage(user.username, data.message);
+    const session = this.chatService.getUser(client.id);
 
-    // emit only to user's room
-    this.server.to(user.room).emit(EVENTS.MESSAGE, payload);
+    if (!session) {
+      client.emit('error', { message: 'User not in conversation' });
+      return;
+    }
+
+    // 🔴 IMPORTANT: fetch conversation
+    const conversation = await this.conversationRepo.findOne({
+      where: { id: session.conversationId },
+    });
+
+    if (!conversation) {
+      client.emit('error', { message: 'Conversation not found' });
+      return;
+    }
+
+    const savedMessage = await this.messageService.createMessage(
+      data.message,
+      user,
+      conversation,
+    );
+
+    this.server.to(session.conversationId).emit(EVENTS.MESSAGE, {
+      user: user.username,
+      message: savedMessage.content,
+      timestamp: savedMessage.createdAt,
+    });
   }
 }

@@ -6,6 +6,7 @@ import {
   ManyToOne,
 } from 'typeorm';
 import { User } from '../../auth/entities/user.entity';
+import { Conversation } from '../../chat/entities/conversation.entity';
 
 @Entity('messages')
 export class Message {
@@ -22,4 +23,9 @@ export class Message {
     onDelete: 'CASCADE',
   })
   user!: User;
+
+  @ManyToOne(() => Conversation, (conversation) => conversation.messages, {
+    onDelete: 'CASCADE',
+  })
+  conversation!: Conversation;
 }

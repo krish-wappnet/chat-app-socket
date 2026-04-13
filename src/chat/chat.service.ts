@@ -2,15 +2,15 @@ import { Injectable } from '@nestjs/common';
 
 type User = {
   username: string;
-  room: string;
+  conversationId: string;
 };
 
 @Injectable()
 export class ChatService {
   private users = new Map<string, User>();
 
-  addUser(socketId: string, username: string, room: string) {
-    const user: User = { username, room };
+  addUser(socketId: string, username: string, conversationId: string) {
+    const user: User = { username, conversationId };
     this.users.set(socketId, user);
     return user;
   }

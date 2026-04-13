@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Message } from './entities/message.entity';
 import { Repository } from 'typeorm';
 import { User } from '../auth/entities/user.entity';
+import { Conversation } from '../chat/entities/conversation.entity';
 
 @Injectable()
 export class MessageService {
@@ -12,10 +13,11 @@ export class MessageService {
   ) {}
 
   // ================= SAVE MESSAGE =================
-  async createMessage(content: string, user: User) {
+  async createMessage(content: string, user: User, conversation: Conversation) {
     const message = this.messageRepo.create({
       content,
       user,
+      conversation,
     });
 
     return this.messageRepo.save(message);
